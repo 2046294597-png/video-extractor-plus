@@ -24,6 +24,10 @@ const UA =
 const MOBILE_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
+// 抖音只对搜索引擎爬虫输出 SEO 版 SSR（含 Schema.org VideoObject）。
+// 换这个 UA 才能拿到标题/作者/时长/封面；普通 UA 拿到的是没有数据的空壳页。
+const GOOGLEBOT_UA = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+
 // 白名单：否则这个 Worker 会变成任何人都能白嫖的开放代理
 const ALLOWED_HOSTS = [
   't.me',
@@ -72,10 +76,13 @@ export default {
         {
           ok: true,
           service: 'video-extractor-worker',
-          version: 3,
+          version: 4,
           platforms: ['telegram', 'bilibili', 'douyin'],
           routes: ['/proxy?url=', '/extract'],
+          // 抖音：元数据（标题/作者/封面）始终可拿，视频流依赖下面的解析端点
+          douyinMeta: true,
           douyinParser: !!(env && env.DOUYIN_PARSER),
+          douyinParserKey: !!(env && env.DOUYIN_PARSER_KEY),
         },
         200
       );
@@ -125,6 +132,7 @@ export default {
           {
             error: e && e.message ? e.message : 'Extraction failed',
             code: (e && e.code) || undefined,
+            meta: (e && e.meta) || undefined,
           },
           status
         );
@@ -164,10 +172,13 @@ function detectPlatform(raw) {
   return null;
 }
 
-function httpError(message, status, code) {
+function httpError(message, status, code, meta) {
   const err = new Error(message);
   err.status = status;
   if (code) err.code = code;
+  // 失败时也想把已知的作品信息带回前端（如抖音只能拿到元数据），
+  // 让用户看到"链接没识别错，是平台不给流"，而不是一个空白报错。
+  if (meta) err.meta = meta;
   return err;
 }
 
@@ -598,17 +609,26 @@ async function biliPlayUrl(bvid, cid) {
 // 抖音 解析
 // ---------------------------------------------------------------------------
 //
-// 实测（2026-11）结论：抖音没有"纯 HTTP 就能拿数据"的口子。
+// 实测（2026-11）结论：抖音没有"纯 HTTP 就能拿数据"的口子。逐条验过：
 //   - /aweme/v1/web/aweme/detail  → Blocked by ArgusSecurityPlugin Uifid Not Found
+//     （裸请求 / 带 Referer / 带伪造 ttwid / 带真实 ttwid 申请结果，四次一模一样）
 //   - 桌面 UA 抓分享页            → 返回 _$jsvmprt JS 虚拟机保护页，0 处 play_addr
-//   - 移动 UA 抓分享页            → 能拿到 _ROUTER_DATA（本文件的第 2 层策略）
+//   - 移动 UA 抓分享页            → 有 _ROUTER_DATA，但里面只有页面配置
+//     （renderInSSR:1，itemId 正确，aweme 数据为 0；36 个 script 全是 argus SDK）
 //   - 老接口 iteminfo / snssdk    → 空响应，已下线
+//   - 公开 oEmbed / video/detail  → 不存在
 //
-// 所以做成三层降级：
+// 唯一能在纯 HTTP 下拿到东西的入口：伪装 Googlebot 抓分享页，抖音会返回 SEO 版 SSR。
+// 但它的 Schema.org VideoObject 故意只给 name/creator/duration/thumbnail，
+// <video> 标签只有 poster 没有 src，没有 contentUrl —— 元数据给爬虫，视频流不给。
+//
+// 所以做成四层降级：
 //   ① 短链归一化拿到作品 ID          （稳定）
-//   ② 移动端分享页的 SSR 数据         （对部分公开视频可能有效）
-//   ③ 可选的第三方解析端点            （wrangler.toml 里配置 DOUYIN_PARSER）
-// 三层都失败就抛结构化错误，前端据此给明确提示，而不是让人对着转圈猜。
+//   ② SEO 元数据（Googlebot UA）      （稳定，只到标题/作者/时长/封面）
+//   ③ 移动端分享页的 SSR play_addr    （对部分公开视频可能有效，实测当前无效）
+//   ④ 可选的第三方解析端点            （wrangler.toml 里配置 DOUYIN_PARSER）
+// 全失败时抛结构化错误，并把 ② 拿到的元数据一起带回去，
+// 前端据此显示"作品卡片 + 原因说明"，而不是让人对着转圈猜。
 
 async function extractDouyin(rawUrl, env) {
   const resolved = await resolveDouyinUrl(rawUrl);
@@ -617,15 +637,18 @@ async function extractDouyin(rawUrl, env) {
     throw httpError('无法从链接中解析出抖音作品 ID', 400, 'douyin_no_id');
   }
 
-  // ② 移动端分享页 SSR
+  // ② SEO 元数据：拿不到视频流，但能确认作品存在并拿到标题/作者
+  const meta = await fetchDouyinSeoMeta(id);
+
+  // ③ 移动端分享页 SSR（有 play_addr 就直接成功）
   try {
     const ssr = await fetchDouyinSharePage(id);
     const parsed = ssr ? parseDouyinPage(ssr) : null;
     if (parsed && parsed.videos.length) {
       return {
         platform: 'douyin',
-        title: parsed.title,
-        duration: parsed.duration,
+        title: parsed.title || (meta && meta.title) || '',
+        duration: parsed.duration || (meta && meta.duration) || 0,
         videos: parsed.videos,
         via: 'ssr',
       };
@@ -634,18 +657,85 @@ async function extractDouyin(rawUrl, env) {
     // 继续降级
   }
 
-  // ③ 第三方解析端点
+  // ④ 第三方解析端点
   const viaParser = await tryDouyinParser(resolved.pageUrl, id, env);
   if (viaParser && viaParser.videos.length) {
-    return { platform: 'douyin', title: viaParser.title, videos: viaParser.videos, via: 'parser' };
+    return {
+      platform: 'douyin',
+      title: viaParser.title || (meta && meta.title) || '',
+      videos: viaParser.videos,
+      via: 'parser',
+    };
   }
 
   throw httpError(
-    '抖音的分享页被 JS 虚拟机保护，服务端拿不到视频地址。' +
-      '要提取抖音，需要在 Worker 里配置一个第三方解析端点（wrangler.toml 的 DOUYIN_PARSER）。',
+    '抖音的分享页由 JS 虚拟机（argus）保护，页面里 <video> 只有封面没有地址，' +
+      '服务端拿不到视频流。要提取抖音需在 Worker 配置第三方解析端点（wrangler.toml 的 DOUYIN_PARSER）。',
     422,
-    'douyin_needs_parser'
+    'douyin_needs_parser',
+    meta || undefined
   );
+}
+
+// 伪装搜索引擎抓分享页，解析 Schema.org 的 VideoObject。
+// 这是抖音唯一愿意在纯 HTTP 下交出来的东西：标题、作者、时长、封面。
+async function fetchDouyinSeoMeta(id) {
+  const html = await fetchHtmlWithUa(
+    `https://www.iesdouyin.com/share/video/${id}/`,
+    GOOGLEBOT_UA,
+    20000
+  );
+  if (!html) return null;
+
+  const blocks = html.match(
+    /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
+  );
+  if (!blocks) return null;
+
+  for (const block of blocks) {
+    const body = block.replace(/^<script[^>]*>/i, '').replace(/<\/script>$/i, '');
+    let data;
+    try {
+      data = JSON.parse(body);
+    } catch {
+      continue;
+    }
+    if (!data || data['@type'] !== 'VideoObject') continue;
+
+    // name 形如 "#邪恶小帽咪 - 抖音"，把尾巴去掉
+    const title = String(data.name || '')
+      .replace(/\s*-\s*抖音\s*$/, '')
+      .trim()
+      .slice(0, 120);
+
+    // duration 是 ISO 8601 区间，如 PT0H0M9S
+    let duration = 0;
+    const dm = /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/.exec(String(data.duration || ''));
+    if (dm) {
+      duration =
+        (parseInt(dm[1] || '0', 10) * 3600) +
+        (parseInt(dm[2] || '0', 10) * 60) +
+        parseInt(dm[3] || '0', 10);
+    }
+
+    const creator = data.creator || {};
+    const likes = Array.isArray(creator.interactionStatistic)
+      ? creator.interactionStatistic[0] && creator.interactionStatistic[0].userInteractionCount
+      : null;
+
+    return {
+      id,
+      title,
+      author: typeof creator.name === 'string' ? creator.name.slice(0, 60) : '',
+      cover: Array.isArray(data.thumbnailUrl) ? data.thumbnailUrl[0] || '' : '',
+      duration,
+      uploadDate: data.uploadDate || '',
+      likes: typeof likes === 'number' ? likes : null,
+      pageUrl: `https://www.douyin.com/video/${id}`,
+    };
+  }
+
+  return null;
 }
 
 async function resolveDouyinUrl(rawUrl) {
@@ -741,8 +831,9 @@ function parseDouyinPage(html) {
 }
 
 // 第三方解析端点。契约故意放宽：只要返回体里任意位置有一个像视频地址的字符串
-// 就认，这样常见的开源解析服务基本能直接接。
+// 就认，这样常见的开源解析服务基本能直接接（不要求固定的 JSON 结构）。
 //   wrangler.toml →  [vars]  DOUYIN_PARSER = "https://your-parser.example.com/api?url={url}"
+//   可选鉴权     →  wrangler secret put DOUYIN_PARSER_KEY   （会同时放进 X-API-Key 和 Authorization）
 // 支持 {url} 与 {id} 两个占位符；不配置就跳过这一层。
 async function tryDouyinParser(pageUrl, id, env) {
   const base = env && env.DOUYIN_PARSER;
@@ -759,9 +850,18 @@ async function tryDouyinParser(pageUrl, id, env) {
 
   if (!/^https:\/\//i.test(endpoint)) return null;
 
+  // 很多解析服务要鉴权（如 douyin.wtf 公开实例要求 X-API-Key），
+  // 用 wrangler secret 传，别写进 wrangler.toml。
+  const headers = { 'User-Agent': UA, Accept: 'application/json, text/plain, */*' };
+  const key = env && env.DOUYIN_PARSER_KEY;
+  if (key && typeof key === 'string') {
+    headers['X-API-Key'] = key;
+    headers['Authorization'] = /^Bearer\s/i.test(key) ? key : 'Bearer ' + key;
+  }
+
   try {
     const resp = await fetch(endpoint, {
-      headers: { 'User-Agent': UA, Accept: 'application/json, text/plain, */*' },
+      headers,
       signal: AbortSignal.timeout(20000),
     });
     if (!resp.ok) return null;

@@ -747,7 +747,7 @@
   <div class="app-container">
     <header class="header">
       <div class="logo">🎬</div>
-      <h1>视频提取器 <span style="font-size:11px;color:#64748b;font-weight:400;">v18</span></h1>
+      <h1>视频提取器 <span style="font-size:11px;color:#64748b;font-weight:400;">v19</span></h1>
       <p class="subtitle">支持 B站 · 抖音 · Telegram · Twitter / X 视频下载</p>
       <div class="platform-badges">
         <span class="platform-badge badge-bili">📺 B站</span>
@@ -1903,6 +1903,8 @@ video::-webkit-media-controls{display:flex!important}
           if (!resp.ok || data.error) {
             const err = new Error(data.error || ('后端解析失败（HTTP ' + resp.status + '）'));
             err.code = data.code;
+            // 有些平台失败时仍能带回作品元数据（抖音），带上以便显示作品卡片
+            err.meta = data.meta;
             throw err;
           }
           return data;
@@ -1943,18 +1945,38 @@ video::-webkit-media-controls{display:flex!important}
           // 要单独解释清楚，否则用户只会看到一句「提取失败」。
           if (e && e.code === 'douyin_needs_parser') {
             const err = new Error(
-              '抖音把视频地址放在 JS 虚拟机里现算，服务端抓不到。' +
-              '需要给 Worker 配置一个第三方解析端点（wrangler.toml 的 DOUYIN_PARSER）才能提取。'
+              '抖音的视频地址由浏览器现算，服务端抓不到。' +
+              '在 Worker 配置 DOUYIN_PARSER 后即可提取。'
             );
             err.douyinNeedsParser = true;
+            err.meta = e.meta;
             throw err;
           }
           throw e;
         }
       }
 
+      // 错误卡用的小工具：秒 → 0:09 / 1:23:45，数量 → 5.9k
+      function fmtDur(sec) {
+        const s = Math.max(0, Math.round(sec || 0));
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const r = s % 60;
+        const pad = n => String(n).padStart(2, '0');
+        return h ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
+      }
+
+      function fmtCount(n) {
+        const v = Number(n) || 0;
+        // 中文习惯：一万以上用「万」，不足一万直接显示原数（5.9k 这种写法反而更陌生）
+        if (v >= 10000) return (v / 10000).toFixed(1).replace(/\.0$/, '') + '万';
+        return String(v);
+      }
+
       // 解析失败时在结果区给一张说明卡，比只闪一条 toast 更容易看懂
-      function showErrorCard(platform, heading, detail) {
+      // meta 可选：平台虽不给视频流、但仍能拿到作品信息时（抖音），
+      // 把封面/标题/作者一起显示，用户就知道链接没粘错，卡的是平台。
+      function showErrorCard(platform, heading, detail, meta) {
         const cfg = PLATFORM_CONFIG[platform] || { tagLabel: '?', tagClass: 'tg' };
         currentVideoUrls = [];
         currentVideoIndex = 0;
@@ -1962,10 +1984,40 @@ video::-webkit-media-controls{display:flex!important}
         platformTag.textContent = cfg.tagLabel;
         platformTag.className = `platform-tag ${cfg.tagClass}`;
         resultTitle.textContent = currentSourceUrl || '';
+
+        let metaHTML = '';
+        if (meta && (meta.title || meta.cover)) {
+          const bits = [];
+          if (meta.author) bits.push('@' + meta.author);
+          if (meta.duration) bits.push(fmtDur(meta.duration));
+          if (typeof meta.likes === 'number') bits.push(fmtCount(meta.likes) + ' 赞');
+          metaHTML = `
+            <div style="display:flex;gap:12px;align-items:center;width:100%;max-width:420px;
+                        background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);
+                        border-radius:12px;padding:10px;text-align:left;">
+              ${meta.cover
+                ? `<img src="${escapeAttr(meta.cover)}" alt="" referrerpolicy="no-referrer"
+                        style="width:64px;height:64px;object-fit:cover;border-radius:8px;flex:0 0 auto;background:#0f172a;">`
+                : ''}
+              <div style="min-width:0;">
+                <div style="font-size:13px;font-weight:600;color:#e2e8f0;line-height:1.4;
+                            overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;">
+                  ${escapeHtml(meta.title || '（无标题）')}
+                </div>
+                <div style="font-size:11px;color:#64748b;margin-top:4px;">${escapeHtml(bits.join(' · '))}</div>
+              </div>
+            </div>
+            ${meta.pageUrl
+              ? `<a href="${escapeAttr(meta.pageUrl)}" target="_blank" rel="noopener noreferrer"
+                    style="font-size:12px;color:#38bdf8;text-decoration:none;">在抖音打开 ↗</a>`
+              : ''}`;
+        }
+
         videoContainer.innerHTML = `
           <div class="video-placeholder" style="padding:32px 22px;flex-direction:column;gap:10px;">
             <span style="font-size:30px;">⚠️</span>
             <span style="font-size:15px;font-weight:700;color:#e2e8f0;text-align:center;">${escapeHtml(heading)}</span>
+            ${metaHTML}
             <span style="font-size:12px;color:#94a3b8;text-align:center;line-height:1.7;">${escapeHtml(detail)}</span>
           </div>`;
         resultCard.classList.add('visible');
@@ -2037,7 +2089,12 @@ video::-webkit-media-controls{display:flex!important}
           }
           if (err && err.douyinNeedsParser) {
             currentSourceUrl = url;
-            showErrorCard('douyin', '抖音需要额外配置解析服务', err.message);
+            showErrorCard(
+              'douyin',
+              err.meta ? '已识别作品，但抖音不提供视频流' : '抖音需要额外配置解析服务',
+              err.message,
+              err.meta
+            );
             setStatus('⚠️ 抖音暂不可用：缺少解析端点', '');
             return;
           }
@@ -2045,7 +2102,7 @@ video::-webkit-media-controls{display:flex!important}
           // 塞进状态栏会被截断，改用结果区的说明卡承载
           if (platform === 'bilibili' || platform === 'douyin') {
             currentSourceUrl = url;
-            showErrorCard(platform, '解析失败', err.message);
+            showErrorCard(platform, '解析失败', err.message, err.meta);
             setStatus('❌ ' + err.message, 'error');
             return;
           }
