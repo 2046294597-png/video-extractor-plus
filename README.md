@@ -118,9 +118,19 @@ npx wrangler secret put DOUYIN_PARSER_KEY
 
 | 方案 | 代价 | 命门 |
 |---|---|---|
-| 自建解析服务（如 douyin.wtf / TikTokDownloader，Docker 部署） | 一台 VPS + 维护 | 签名变了要跟着升级 |
+| 自建解析服务（如 [Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)，`douyin.wtf` 的开源本体，Docker 一键起） | 一台 VPS + 定期升级 | 签名变了要跟着升级 |
 | 第三方 API | 代码量最小 | 对方挂就挂；链接要发给别人 |
 | 浏览器扩展 | 一行签名都不用解（用户环境已通过校验） | 是另一个产品形态，PWA 装不了扩展 |
+
+接入自建服务只需要改配置，不用改代码：
+
+```bash
+# wrangler.toml
+[vars]
+DOUYIN_PARSER = "https://你的实例/api/v1/douyin/video?url={url}"
+
+npx wrangler secret put DOUYIN_PARSER_KEY
+```
 
 ## 已知限制
 
