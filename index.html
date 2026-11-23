@@ -9,7 +9,7 @@
   <meta name="apple-mobile-web-app-title" content="视频提取器">
   <link rel="manifest" href="./manifest.json">
   <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='100' fill='%230f0f0f'/><rect width='512' height='512' rx='100' fill='url(%23g)'/><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%25' stop-color='%236366f1'/><stop offset='100%25' stop-color='%237c3aed'/></linearGradient></defs><text x='256' y='200' text-anchor='middle' font-size='140'>🎬</text><text x='256' y='380' text-anchor='middle' font-size='72' fill='white' font-weight='bold'>提取</text></svg>">
-  <title>视频提取器 - Telegram & Twitter</title>
+  <title>视频提取器 - B站 & 抖音 & Telegram & Twitter</title>
   <style>
     :root {
       --bg: #0f0f0f;
@@ -19,6 +19,8 @@
       --primary-glow: rgba(99, 102, 241, 0.3);
       --accent-tg: #2ea6ff;
       --accent-tw: #1d9bf0;
+      --accent-bili: #fb7299;
+      --accent-dy: #25f4ee;
       --text: #e2e8f0;
       --text-secondary: #94a3b8;
       --border: #2d2d4a;
@@ -120,6 +122,18 @@
       border: 1px solid rgba(29, 155, 240, 0.2);
     }
 
+    .badge-bili {
+      background: rgba(251, 114, 153, 0.12);
+      color: var(--accent-bili);
+      border: 1px solid rgba(251, 114, 153, 0.2);
+    }
+
+    .badge-dy {
+      background: rgba(37, 244, 238, 0.12);
+      color: var(--accent-dy);
+      border: 1px solid rgba(37, 244, 238, 0.2);
+    }
+
     .input-section {
       position: relative;
     }
@@ -146,6 +160,16 @@
     .input-wrapper.detected-tw {
       border-color: var(--accent-tw);
       box-shadow: 0 0 0 4px rgba(29, 155, 240, 0.15);
+    }
+
+    .input-wrapper.detected-bili {
+      border-color: var(--accent-bili);
+      box-shadow: 0 0 0 4px rgba(251, 114, 153, 0.15);
+    }
+
+    .input-wrapper.detected-dy {
+      border-color: var(--accent-dy);
+      box-shadow: 0 0 0 4px rgba(37, 244, 238, 0.15);
     }
 
     .input-wrapper.error {
@@ -334,6 +358,8 @@
 
     .platform-tag.tg { background: rgba(46,166,255,0.15); color: var(--accent-tg); }
     .platform-tag.tw { background: rgba(29,155,240,0.15); color: var(--accent-tw); }
+    .platform-tag.bili { background: rgba(251,114,153,0.15); color: var(--accent-bili); }
+    .platform-tag.dy { background: rgba(37,244,238,0.15); color: var(--accent-dy); }
 
     .result-title {
       flex: 1;
@@ -486,6 +512,8 @@
 
     .history-platform.tg { background: rgba(46,166,255,0.15); }
     .history-platform.tw { background: rgba(29,155,240,0.15); }
+    .history-platform.bili { background: rgba(251,114,153,0.15); }
+    .history-platform.dy { background: rgba(37,244,238,0.15); }
 
     .history-info {
       flex: 1;
@@ -719,9 +747,11 @@
   <div class="app-container">
     <header class="header">
       <div class="logo">🎬</div>
-      <h1>视频提取器 <span style="font-size:11px;color:#64748b;font-weight:400;">v17</span></h1>
-      <p class="subtitle">支持 Telegram · Twitter / X 视频下载</p>
+      <h1>视频提取器 <span style="font-size:11px;color:#64748b;font-weight:400;">v18</span></h1>
+      <p class="subtitle">支持 B站 · 抖音 · Telegram · Twitter / X 视频下载</p>
       <div class="platform-badges">
+        <span class="platform-badge badge-bili">📺 B站</span>
+        <span class="platform-badge badge-dy">🎵 抖音</span>
         <span class="platform-badge badge-tg">✈️ Telegram</span>
         <span class="platform-badge badge-tw">𝕏 Twitter</span>
       </div>
@@ -1034,13 +1064,48 @@
       let currentIsDownloaded = false;
       let toastTimer = null;
 
+      // directFetch：视频 CDN 本身给了 ACAO:*，可以浏览器直连，不必先撞一遍后端。
+      //   B站 实测 bilivideo.com 返回 Access-Control-Allow-Origin: * 且支持 Range。
+      // urlExpires：直链带时效参数，历史记录里不能直接复用，必须重新解析。
+      //   实测 B站 直链约 2 小时后失效，复用会得到一个黑屏死链。
       const PLATFORM_CONFIG = {
+        bilibili: {
+          name: 'Bilibili',
+          icon: '📺',
+          tagClass: 'bili',
+          tagLabel: 'B站',
+          color: '#fb7299',
+          directFetch: true,
+          urlExpires: true,
+          domains: ['bilibili.com', 'b23.tv'],
+          patterns: [
+            /^https?:\/\/(www\.|m\.)?bilibili\.com\/video\/(BV[0-9A-Za-z]{10}|av\d+)/i,
+            /^https?:\/\/b23\.tv\/[A-Za-z0-9]+/i
+          ]
+        },
+        douyin: {
+          name: 'Douyin',
+          icon: '🎵',
+          tagClass: 'dy',
+          tagLabel: 'DY',
+          color: '#25f4ee',
+          directFetch: true,
+          urlExpires: true,
+          domains: ['douyin.com', 'iesdouyin.com'],
+          patterns: [
+            /^https?:\/\/v\.douyin\.com\/[A-Za-z0-9_-]+/i,
+            /^https?:\/\/(www\.)?douyin\.com\/(video|note|share\/video)\/\d{15,25}/i,
+            /^https?:\/\/(www\.)?iesdouyin\.com\/share\/video\/\d{15,25}/i
+          ]
+        },
         telegram: {
           name: 'Telegram',
           icon: '✈️',
           tagClass: 'tg',
           tagLabel: 'TG',
           color: '#2ea6ff',
+          directFetch: false,
+          urlExpires: false,
           domains: ['t.me'],
           patterns: [/^https?:\/\/(www\.)?t\.me\/[^\/]+\/\d+/i]
         },
@@ -1050,6 +1115,8 @@
           tagClass: 'tw',
           tagLabel: 'TW',
           color: '#1d9bf0',
+          directFetch: false,
+          urlExpires: false,
           domains: ['twitter.com', 'x.com', 'fxtwitter.com', 'vxtwitter.com', 'fixupx.com'],
           patterns: [
             /^https?:\/\/(www\.)?(twitter\.com|x\.com)\/\w+\/status\/\d+/i,
@@ -1058,6 +1125,14 @@
           ]
         }
       };
+
+      // 允许浏览器直连视频 CDN 的平台。这类平台不必先经代理，
+      // 直接 fetch 就能播/下载，省掉一次后端往返。
+      const DIRECT_FETCH_PLATFORMS = new Set(
+        Object.entries(PLATFORM_CONFIG)
+          .filter(([, cfg]) => cfg.directFetch)
+          .map(([key]) => key)
+      );
 
       function detectPlatform(url) {
         if (!url) return null;
@@ -1075,23 +1150,26 @@
         return null;
       }
 
+      // 识别态的高亮类名由 PLATFORM_CONFIG 生成，加平台时不用再回来改这里
+      const DETECTED_CLASSES = Object.values(PLATFORM_CONFIG).map((c) => 'detected-' + c.tagClass);
+
+      function clearDetectedUI() {
+        inputWrapper.classList.remove('error', ...DETECTED_CLASSES);
+      }
+
       function updateInputUI(platform) {
-        inputWrapper.classList.remove('detected-tg', 'detected-tw', 'error');
-        if (platform === 'telegram') {
-          inputWrapper.classList.add('detected-tg');
-          inputIcon.textContent = '✈️';
-          extractBtn.disabled = false;
-          setStatus('检测到 Telegram 链接 ✅', 'success');
-        } else if (platform === 'twitter') {
-          inputWrapper.classList.add('detected-tw');
-          inputIcon.textContent = '𝕏';
-          extractBtn.disabled = false;
-          setStatus('检测到 Twitter/X 链接 ✅', 'success');
-        } else {
+        clearDetectedUI();
+        const cfg = platform && PLATFORM_CONFIG[platform];
+        if (!cfg) {
           inputIcon.textContent = '🔗';
           extractBtn.disabled = true;
           setStatus('');
+          return;
         }
+        inputWrapper.classList.add('detected-' + cfg.tagClass);
+        inputIcon.textContent = cfg.icon;
+        extractBtn.disabled = false;
+        setStatus(`检测到 ${cfg.name} 链接 ✅`, 'success');
       }
 
       function setStatus(msg, type) {
@@ -1178,7 +1256,11 @@
               urlInput.value = h.url;
               const platform = detectPlatform(h.url);
               updateInputUI(platform);
-              if (h.videoUrl) {
+              // B站 / 抖音 的直链带时效参数（B站 实测约 2 小时）。
+              // 不能复用历史里存下来的地址，否则第二天点开会是一个黑屏死链，
+              // 而且没有任何报错。这类平台一律重新解析。
+              const hCfg = PLATFORM_CONFIG[h.platform] || {};
+              if (h.videoUrl && !hCfg.urlExpires) {
                 showResult(h.videoUrl, h.platform, h.url);
               } else {
                 extractVideo();
@@ -1245,6 +1327,13 @@
           .replace(/'/g, '&#39;');
       }
 
+      // 播放/下载用的地址：CDN 已开放 CORS 的平台直接用原地址，
+      // 这样即使后端不可达也能播，避免把本来能播的视频包进一个死掉的代理。
+      function mediaUrl(url) {
+        if (DIRECT_FETCH_PLATFORMS.has(currentPlatform)) return url;
+        return workerProxyUrl(url);
+      }
+
       function buildIframeHTML(videoUrl) {
         return `<!DOCTYPE html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
@@ -1254,7 +1343,7 @@ video::-webkit-media-controls{display:flex!important}
 .e{display:none;color:#f87171;font-size:14px;text-align:center;padding:24px;font-family:-apple-system,sans-serif;position:absolute}
 .e b{display:block;font-size:12px;color:#94a3b8;margin-top:4px}
 </style></head><body>
-<video src="${workerProxyUrl(videoUrl).replace(/"/g, '&quot;')}" controls playsinline
+<video src="${escapeAttr(mediaUrl(videoUrl))}" controls playsinline
  onerror="document.querySelector('.e').style.display='block';this.style.display='none'"
  onloadedmetadata="document.querySelector('.e').style.display='none'"></video>
 <div class="e">⚠ 视频被平台拦截<br><b>请使用下方按钮下载</b></div>
@@ -1302,7 +1391,21 @@ video::-webkit-media-controls{display:flex!important}
         resultCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
 
-      async function loadVideoViaProxy(videoUrl) {
+      async function loadVideoViaProxy(videoUrl, skipDirect) {
+        // CDN 支持 Range 且开放 CORS 的平台，直接交给 <video> 流式播放：
+        // 首帧立刻出来、能拖进度条，也不用把几十 MB 读进内存。
+        // 播放失败（CDN 校验 UA / 直链过期）再退回 Blob -> iframe 的老路径。
+        if (!skipDirect && DIRECT_FETCH_PLATFORMS.has(currentPlatform)) {
+          if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
+          videoContainer.innerHTML = `<video controls playsinline preload="metadata" referrerpolicy="no-referrer" src="${escapeAttr(videoUrl)}" type="video/mp4"></video>`;
+          setStatus('', '');
+          const el = videoContainer.querySelector('video');
+          if (el) {
+            el.addEventListener('error', () => loadVideoViaProxy(videoUrl, true), { once: true });
+          }
+          return;
+        }
+
         const blob = await fetchVideoAsBlob(videoUrl);
         if (blob) {
           if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
@@ -1324,39 +1427,63 @@ video::-webkit-media-controls{display:flex!important}
       // 下载硬上限：超过就放弃 Blob 方案，避免手机内存被打爆
       const MAX_DOWNLOAD_BYTES = 300 * 1024 * 1024;
 
+      // 把一个 Response 读成 Blob：校验类型（HTML 说明是拦截页）、限制内存占用
+      async function readVideoResponse(resp, onProgress) {
+        const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('text/html')) return null;
+
+        const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
+        if (contentLength > MAX_DOWNLOAD_BYTES) return null;
+        if (!resp.body) return null;
+
+        if (onProgress && contentLength) onProgress(0, contentLength);
+
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let received = 0;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          received += value.length;
+          if (received > MAX_DOWNLOAD_BYTES) {
+            try { await reader.cancel(); } catch {}
+            return null;
+          }
+          chunks.push(value);
+          if (onProgress && contentLength) onProgress(received, contentLength);
+        }
+
+        const blob = new Blob(chunks, { type: contentType || 'video/mp4' });
+        return blob.size > 1000 ? blob : null;
+      }
+
+      // 直连取视频（不经任何代理）。B站 的 bilivideo.com 实测带
+      // Access-Control-Allow-Origin: *，浏览器可以直接读，没必要绕后端。
+      async function fetchDirectBlob(videoUrl, onProgress) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 30000);
+        try {
+          const resp = await fetch(videoUrl, { signal: ctrl.signal });
+          if (!resp.ok) return null;
+          return await readVideoResponse(resp, onProgress);
+        } catch {
+          return null;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
       async function fetchVideoAsBlob(videoUrl, onProgress) {
+        // 对 CDN 已开放 CORS 的平台先直连：fetchWithProxies 把后端排在第一位，
+        // 后端不通时要白等一个完整超时（20s）才会轮到下一个，这里是首屏体感的关键。
+        if (DIRECT_FETCH_PLATFORMS.has(currentPlatform)) {
+          const direct = await fetchDirectBlob(videoUrl, onProgress);
+          if (direct) return direct;
+        }
         return fetchWithProxies(videoUrl, {
           timeout: 90000,
-          accept: async (resp) => {
-            const contentType = (resp.headers.get('content-type') || '').toLowerCase();
-            // 代理返回 HTML 说明是错误页 / 拦截页，不是视频
-            if (contentType.includes('text/html')) return null;
-
-            const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
-            if (contentLength > MAX_DOWNLOAD_BYTES) return null;
-            if (!resp.body) return null;
-
-            if (onProgress && contentLength) onProgress(0, contentLength);
-
-            const reader = resp.body.getReader();
-            const chunks = [];
-            let received = 0;
-
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              received += value.length;
-              if (received > MAX_DOWNLOAD_BYTES) {
-                try { await reader.cancel(); } catch {}
-                return null;
-              }
-              chunks.push(value);
-              if (onProgress && contentLength) onProgress(received, contentLength);
-            }
-
-            const blob = new Blob(chunks, { type: contentType || 'video/mp4' });
-            return blob.size > 1000 ? blob : null;
-          }
+          accept: (resp) => readVideoResponse(resp, onProgress)
         });
       }
 
@@ -1753,6 +1880,98 @@ video::-webkit-media-controls{display:flex!important}
         throw new Error('所有解析方式均失败，可能是该推文为私密账号或包含限制内容');
       }
 
+      // ===================== 后端解析入口（B站 / 抖音）=====================
+      // 这两个平台都必须在 Worker 里解析：
+      //   B站  —— api.bilibili.com 见到 Origin 头就 403，浏览器直连必败
+      //   抖音 —— 分享页要带移动端 UA 才走 SSR，桌面环境拿到的是 JS 虚拟机保护页
+      // 前端只负责把原始链接发过去，拿回视频地址数组。
+      async function postExtract(url) {
+        if (!HAS_WORKER) {
+          throw new Error('该平台需要后端解析，请先配置 Worker 地址');
+        }
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 25000);
+        try {
+          const resp = await fetch(WORKER_URL + '/extract', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url }),
+            signal: ctrl.signal
+          });
+          const data = await resp.json().catch(() => null);
+          if (!data) throw new Error('后端返回了非 JSON 响应（HTTP ' + resp.status + '）');
+          if (!resp.ok || data.error) {
+            const err = new Error(data.error || ('后端解析失败（HTTP ' + resp.status + '）'));
+            err.code = data.code;
+            throw err;
+          }
+          return data;
+        } catch (e) {
+          if (e && e.name === 'AbortError') throw new Error('后端解析超时（25 秒）');
+          throw e;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      function pickVideoUrls(payload) {
+        const list = Array.isArray(payload && payload.videos) ? payload.videos : [];
+        return list.map(v => (typeof v === 'string' ? v : v && v.url)).filter(Boolean);
+      }
+
+      async function extractBilibiliVideo(url) {
+        setStatus('正在解析 B站 视频...', '');
+        // 短链和多 P 都交给 Worker 归一化，前端不做二次解析
+        const payload = await postExtract(url);
+        const urls = pickVideoUrls(payload);
+        if (!urls.length) throw new Error('没有解析到可用的视频直链');
+        if (payload.limited) {
+          showToast(`该视频共 ${payload.limited.total} 个分P，已解析前 ${payload.limited.parsed} 个`);
+        }
+        return urls;
+      }
+
+      async function extractDouyinVideo(url) {
+        setStatus('正在解析抖音视频...', '');
+        try {
+          const payload = await postExtract(url);
+          const urls = pickVideoUrls(payload);
+          if (!urls.length) throw new Error('没有解析到可用的视频直链');
+          return urls;
+        } catch (e) {
+          // 这个错误码是「缺第三方解析端点」，不是普通的解析失败，
+          // 要单独解释清楚，否则用户只会看到一句「提取失败」。
+          if (e && e.code === 'douyin_needs_parser') {
+            const err = new Error(
+              '抖音把视频地址放在 JS 虚拟机里现算，服务端抓不到。' +
+              '需要给 Worker 配置一个第三方解析端点（wrangler.toml 的 DOUYIN_PARSER）才能提取。'
+            );
+            err.douyinNeedsParser = true;
+            throw err;
+          }
+          throw e;
+        }
+      }
+
+      // 解析失败时在结果区给一张说明卡，比只闪一条 toast 更容易看懂
+      function showErrorCard(platform, heading, detail) {
+        const cfg = PLATFORM_CONFIG[platform] || { tagLabel: '?', tagClass: 'tg' };
+        currentVideoUrls = [];
+        currentVideoIndex = 0;
+        currentPlatform = platform;
+        platformTag.textContent = cfg.tagLabel;
+        platformTag.className = `platform-tag ${cfg.tagClass}`;
+        resultTitle.textContent = currentSourceUrl || '';
+        videoContainer.innerHTML = `
+          <div class="video-placeholder" style="padding:32px 22px;flex-direction:column;gap:10px;">
+            <span style="font-size:30px;">⚠️</span>
+            <span style="font-size:15px;font-weight:700;color:#e2e8f0;text-align:center;">${escapeHtml(heading)}</span>
+            <span style="font-size:12px;color:#94a3b8;text-align:center;line-height:1.7;">${escapeHtml(detail)}</span>
+          </div>`;
+        resultCard.classList.add('visible');
+        resultCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+
       async function extractVideo() {
         const url = urlInput.value.trim();
         if (!url) {
@@ -1763,7 +1982,7 @@ video::-webkit-media-controls{display:flex!important}
         const platform = detectPlatform(url);
         if (!platform) {
           inputWrapper.classList.add('error');
-          setStatus('❌ 不支持的链接格式，请粘贴 Telegram 或 Twitter 视频链接', 'error');
+          setStatus('❌ 不支持的链接格式，请粘贴 B站 / 抖音 / Telegram / Twitter 视频链接', 'error');
           return;
         }
 
@@ -1782,6 +2001,10 @@ video::-webkit-media-controls{display:flex!important}
             }
           } else if (platform === 'twitter') {
             videoUrls = await extractTwitterVideo(url);
+          } else if (platform === 'bilibili') {
+            videoUrls = await extractBilibiliVideo(url);
+          } else if (platform === 'douyin') {
+            videoUrls = await extractDouyinVideo(url);
           } else {
             throw new Error('不支持的平台');
           }
@@ -1810,6 +2033,20 @@ video::-webkit-media-controls{display:flex!important}
             } else {
               showExtractionFailedView(url, err);
             }
+            return;
+          }
+          if (err && err.douyinNeedsParser) {
+            currentSourceUrl = url;
+            showErrorCard('douyin', '抖音需要额外配置解析服务', err.message);
+            setStatus('⚠️ 抖音暂不可用：缺少解析端点', '');
+            return;
+          }
+          // B站 / 抖音 的失败原因通常较长（风控、地区限制、充电专属），
+          // 塞进状态栏会被截断，改用结果区的说明卡承载
+          if (platform === 'bilibili' || platform === 'douyin') {
+            currentSourceUrl = url;
+            showErrorCard(platform, '解析失败', err.message);
+            setStatus('❌ ' + err.message, 'error');
             return;
           }
           inputWrapper.classList.add('error');
@@ -2115,7 +2352,7 @@ video::-webkit-media-controls{display:flex!important}
 @keyframes fadeOut{to{opacity:0}}
 </style></head><body>
 <div class="info">长按视频保存到手机</div>
-<video src="${workerProxyUrl(videoUrl).replace(/"/g, '&quot;')}" controls playsinline autoplay></video>
+<video src="${escapeAttr(mediaUrl(videoUrl))}" controls playsinline autoplay></video>
 </body></html>`;
       }
 
@@ -2306,7 +2543,7 @@ video::-webkit-media-controls{display:flex!important}
         clearBtn.classList.toggle('visible', url.length > 0);
 
         if (url.length === 0) {
-          inputWrapper.classList.remove('detected-tg', 'detected-tw', 'error');
+          clearDetectedUI();
           inputIcon.textContent = '🔗';
           extractBtn.disabled = true;
           setStatus('');
@@ -2332,7 +2569,7 @@ video::-webkit-media-controls{display:flex!important}
       clearBtn.addEventListener('click', () => {
         urlInput.value = '';
         urlInput.focus();
-        inputWrapper.classList.remove('detected-tg', 'detected-tw', 'error');
+        clearDetectedUI();
         inputIcon.textContent = '🔗';
         extractBtn.disabled = true;
         setStatus('');

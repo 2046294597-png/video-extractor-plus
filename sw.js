@@ -1,4 +1,4 @@
-﻿const CACHE_NAME = 'video-extractor-v17';
+﻿const CACHE_NAME = 'video-extractor-v18';
 const PRECACHE = ['./', './index.html', './manifest.json'];
 
 // ===================== 大文件流式下载 =====================
@@ -8,8 +8,21 @@ const PRECACHE = ['./', './index.html', './manifest.json'];
 // 全程不经过 JS 内存，多大都行，还支持断点续传（Range 原样转发）。
 const DOWNLOAD_PATH = '__download';
 
-// 只允许下载这些域的视频，避免这个端点被当成任意文件的下载器
-const DOWNLOAD_HOSTS = ['telesco.pe', 'twimg.com', 'xgvideo.com', 'vxtwitter.com'];
+// 只允许下载这些域的视频，避免这个端点被当成任意文件的下载器。
+// 加平台时这里和 worker/worker.js 的 ALLOWED_HOSTS 必须同步，
+// 漏一边的表现是「能提取但下载 403」，且报错信息只有一句 host not allowed。
+const DOWNLOAD_HOSTS = [
+  'telesco.pe',
+  'twimg.com',
+  'vxtwitter.com',
+  // B站 视频 CDN：cn-gddg-ct-01-12.bilivideo.com 之类的边缘节点都在这个域下
+  'bilivideo.com',
+  // 抖音视频 CDN（移动端 SSR / 第三方解析拿到的直链）
+  'douyinvod.com',
+  'douyin.com',
+  'zjcdn.com',
+  'byteimg.com',
+];
 
 function hostAllowed(hostname) {
   return DOWNLOAD_HOSTS.some((h) => hostname === h || hostname.endsWith('.' + h));

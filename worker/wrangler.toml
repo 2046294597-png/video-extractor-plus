@@ -9,3 +9,20 @@ workers_dev = true
 
 # Free tier: 100,000 requests/day
 # Deploy with: npx wrangler deploy
+
+[vars]
+# ---------------------------------------------------------------------------
+# 抖音专用：可选的第三方解析端点
+# ---------------------------------------------------------------------------
+# 抖音的分享页有 JS 虚拟机保护（_$jsvmprt），服务端拿不到视频地址。
+# 纯 Worker 方案解不开，除非挂一个已经解决了签名问题的解析服务。
+#
+# 配了这一项，/extract 处理抖音链接时会多走一层降级：
+#   GET <你的端点>?url=<作品页地址>   → 返回体里任意位置带视频地址即可
+# 支持占位符，二选一：
+#   DOUYIN_PARSER = "https://your-parser.example.com/api?url={url}"
+#   DOUYIN_PARSER = "https://your-parser.example.com/api?id={id}"
+# 不配的话，抖音链接会返回 422 { code: "douyin_needs_parser" }，
+# 前端会展示对应说明，B站 / Telegram / Twitter 不受影响。
+#
+# DOUYIN_PARSER = "https://your-parser.example.com/api?url={url}"

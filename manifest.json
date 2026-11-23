@@ -1,7 +1,7 @@
 {
   "name": "视频提取器",
   "short_name": "视频提取",
-  "description": "提取 Telegram 和 Twitter/X 视频，支持在线预览与下载",
+  "description": "提取 B站、抖音、Telegram 和 Twitter/X 视频，支持在线预览与下载",
   "start_url": "./",
   "display": "standalone",
   "orientation": "portrait",

@@ -5,7 +5,10 @@
 // 路由：
 //   GET  /              健康检查
 //   GET  /proxy?url=    通用 GET 代理（转发 Range，供 <video> 拖动进度条）
-//   POST /extract       { tgUrl } → { videoUrl, source }
+//   POST /extract       { url } → { platform, title?, duration?, videos: [{ url, size, quality, part? }] }
+//                       兼容旧字段 { tgUrl }
+//
+// 平台分发：t.me / bilibili.com / b23.tv / douyin.com / v.douyin.com
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -16,6 +19,10 @@ const CORS = {
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+// 抖音的分享页只有移动端 UA 才会走 SSR 渲染（桌面 UA 返回的是 JS 虚拟机保护页）
+const MOBILE_UA =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 // 白名单：否则这个 Worker 会变成任何人都能白嫖的开放代理
 const ALLOWED_HOSTS = [
@@ -28,6 +35,18 @@ const ALLOWED_HOSTS = [
   'api.fxtwitter.com',
   'platform.twitter.com',
   'abs.twimg.com',
+  'api.bilibili.com',
+  'www.bilibili.com',
+  'b23.tv',
+  'bilivideo.com',
+  'hdslb.com',
+  // 抖音：URL 的 host 是 douyin.com，视频流在各家 CDN 上
+  'douyin.com',
+  'iesdouyin.com',
+  'douyinvod.com',
+  'douyinpic.com',
+  'zjcdn.com',
+  'byteimg.com',
 ];
 
 const UPSTREAM_TIMEOUT_MS = 25000;
@@ -35,8 +54,13 @@ const UPSTREAM_TIMEOUT_MS = 25000;
 // 1GB 的视频在手机上要下十几分钟，3 分钟不够用，给到 30 分钟。
 const PROXY_TIMEOUT_MS = 1800000;
 
+// B站 多 P 的处理上限：一个 100P 的合集全解析会打爆 Worker，
+// 限 10 个 + 并发 3，超出的在响应里告诉前端「还有多少个没解析」。
+const BILI_MAX_PARTS = 10;
+const BILI_CONCURRENCY = 3;
+
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') {
@@ -45,7 +69,14 @@ export default {
 
     if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
       return json(
-        { ok: true, service: 'video-extractor-worker', routes: ['/proxy?url=', '/extract'] },
+        {
+          ok: true,
+          service: 'video-extractor-worker',
+          version: 3,
+          platforms: ['telegram', 'bilibili', 'douyin'],
+          routes: ['/proxy?url=', '/extract'],
+          douyinParser: !!(env && env.DOUYIN_PARSER),
+        },
         200
       );
     }
@@ -56,16 +87,38 @@ export default {
 
     if (request.method === 'POST' && url.pathname === '/extract') {
       try {
-        const { tgUrl } = await request.json();
-        if (!tgUrl || typeof tgUrl !== 'string' || !tgUrl.includes('t.me')) {
-          return json({ error: 'Invalid Telegram URL' }, 400);
+        const body = await request.json().catch(() => null);
+        // 新字段 url，旧版前端发的是 tgUrl，两个都认
+        const raw = body && (body.url || body.tgUrl);
+        if (!raw || typeof raw !== 'string') {
+          return json({ error: 'Missing url' }, 400);
+        }
+        const target = raw.trim();
+        const platform = detectPlatform(target);
+
+        if (platform === 'telegram') {
+          const result = await extractTelegramVideo(target);
+          if (!result) return json({ error: 'No video found' }, 404);
+          return json(
+            {
+              platform: 'telegram',
+              videoUrl: result.videoUrl,
+              source: result.source,
+              videos: [{ url: result.videoUrl }],
+            },
+            200
+          );
         }
 
-        const result = await extractTelegramVideo(tgUrl);
-        if (!result) {
-          return json({ error: 'No video found' }, 404);
+        if (platform === 'bilibili') {
+          return json(await extractBilibili(target), 200);
         }
-        return json({ videoUrl: result.videoUrl, source: result.source }, 200);
+
+        if (platform === 'douyin') {
+          return json(await extractDouyin(target, env), 200);
+        }
+
+        return json({ error: 'Unsupported link: ' + safeHost(target) }, 400);
       } catch (e) {
         const status = (e && e.status) || 500;
         return json(
@@ -87,6 +140,35 @@ function json(data, status) {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS },
   });
+}
+
+function safeHost(raw) {
+  try {
+    return new URL(raw).hostname;
+  } catch {
+    return String(raw).slice(0, 40);
+  }
+}
+
+function detectPlatform(raw) {
+  let host = '';
+  try {
+    host = new URL(raw).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+  const hit = (base) => host === base || host.endsWith('.' + base);
+  if (hit('t.me') || hit('telegram.org')) return 'telegram';
+  if (hit('bilibili.com') || hit('b23.tv')) return 'bilibili';
+  if (hit('douyin.com') || hit('iesdouyin.com')) return 'douyin';
+  return null;
+}
+
+function httpError(message, status, code) {
+  const err = new Error(message);
+  err.status = status;
+  if (code) err.code = code;
+  return err;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +202,8 @@ async function handleProxy(request, url) {
     Accept: '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
   };
+  // B站 CDN 收到来自别站的 Referer 会直接 503，所以这里只转发 Range，
+  // 绝对不要把浏览器带来的 Referer / Origin 透传下去。
   const range = request.headers.get('Range');
   if (range) headers['Range'] = range;
 
@@ -225,13 +309,6 @@ async function extractTelegramVideo(url) {
 function isNotSupportedPage(html) {
   return /tgme_widget_message_video_player[^"]*not_supported/i.test(html) ||
     /message_media_not_supported/i.test(html);
-}
-
-function httpError(message, status, code) {
-  const err = new Error(message);
-  err.status = status;
-  if (code) err.code = code;
-  return err;
 }
 
 async function fetchHtml(url, timeoutMs = UPSTREAM_TIMEOUT_MS) {
@@ -349,4 +426,427 @@ function absolutize(raw, baseUrl) {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// B站 解析
+// ---------------------------------------------------------------------------
+//
+// 实测（2026-11）：
+//   - /x/web-interface/view 与 /x/player/playurl 都不需要登录、不需要 wbi 签名
+//   - playurl 用 fnval=1&platform=html5 直接给单文件 mp4（已含音轨），不用合流
+//   - 但 api.bilibili.com 见到 Origin 头就 403，所以这两步必须在服务端做
+//   - 视频 CDN 反而全开 CORS，所以视频本体交给浏览器直连，不占后端带宽
+
+const BILI_QUALITY_NAME = {
+  6: '240P', 16: '360P', 32: '480P', 64: '720P', 74: '720P60',
+  80: '1080P', 112: '1080P+', 116: '1080P60', 120: '4K', 125: 'HDR', 126: '杜比', 127: '8K',
+};
+
+// B站 的业务错误码 → 人话。在 Worker 里映射，前端拿到的就是可以直接展示的句子。
+const BILI_ERRORS = {
+  '-400': '链接里的视频号不合法',
+  '-403': 'B站 拒绝访问（可能是接口风控，稍后重试）',
+  '-404': '视频不存在或已被删除',
+  '-352': '触发 B站 风控，请稍后重试',
+  '-10403': '该视频有地区限制，当前节点无法访问',
+  62002: '稿件不可见（私密 / 审核中 / 已下架）',
+  62004: '稿件审核中',
+};
+
+function biliError(code, fallback) {
+  const key = String(code);
+  const msg = BILI_ERRORS[key] || fallback || `B站 返回错误码 ${code}`;
+  return httpError(msg, 422, 'bili_' + key);
+}
+
+async function biliApi(pathWithQuery) {
+  const resp = await fetch('https://api.bilibili.com' + pathWithQuery, {
+    headers: {
+      'User-Agent': UA,
+      Accept: 'application/json, text/plain, */*',
+      // Referer 对 B站 接口是安全的（实测 200），Origin 才是雷区，绝不能带
+      Referer: 'https://www.bilibili.com/',
+    },
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    throw httpError(`B站 接口不可用（HTTP ${resp.status}）`, 502, 'bili_http_' + resp.status);
+  }
+  return await resp.json();
+}
+
+async function extractBilibili(rawUrl) {
+  const pageUrl = await resolveBilibiliUrl(rawUrl);
+
+  const bv = (pageUrl.match(/BV[0-9A-Za-z]{10}/) || [])[0];
+  const av = (pageUrl.match(/\/video\/av(\d+)/i) || pageUrl.match(/[?&]aid=(\d+)/) || [])[1];
+  if (!bv && !av) {
+    throw httpError('链接里找不到 BV 号或 av 号', 400, 'bili_no_id');
+  }
+
+  // 分 P 参数：?p=2
+  const pMatch = pageUrl.match(/[?&]p=(\d+)/);
+  const wantedPage = pMatch ? Math.max(1, parseInt(pMatch[1], 10)) : 1;
+
+  const viewPath = bv
+    ? `/x/web-interface/view?bvid=${bv}`
+    : `/x/web-interface/view?aid=${av}`;
+  const view = await biliApi(viewPath);
+  if (view.code !== 0) throw biliError(view.code, view.message);
+  const info = view.data || {};
+  const bvid = info.bvid || bv;
+
+  const allPages = Array.isArray(info.pages) && info.pages.length
+    ? info.pages
+    : [{ cid: info.cid, page: 1, part: info.title }];
+
+  // 指定了 ?p=N 就只解析那一 P，否则解析前 10 P
+  let targets = allPages;
+  if (pMatch) {
+    const one = allPages.find((x) => Number(x.page) === wantedPage);
+    targets = one ? [one] : allPages.slice(0, 1);
+  }
+  const totalParts = allPages.length;
+  targets = targets.slice(0, BILI_MAX_PARTS);
+  const multi = targets.length > 1;
+
+  const results = await mapLimit(targets, BILI_CONCURRENCY, async (pg) => {
+    try {
+      const play = await biliPlayUrl(bvid, pg.cid);
+      if (!play) return null;
+      return {
+        url: play.url,
+        size: play.size,
+        quality: play.quality,
+        part: multi ? (pg.part || `P${pg.page}`) : undefined,
+      };
+    } catch {
+      // 单个分 P 失败不该拖垮整个合集
+      return null;
+    }
+  });
+
+  const videos = results.filter(Boolean);
+  if (!videos.length) {
+    throw httpError('该视频没有可取用的直链（可能是充电专属或版权限制）', 422, 'bili_no_stream');
+  }
+
+  return {
+    platform: 'bilibili',
+    title: info.title || '',
+    duration: info.duration || 0,
+    videos,
+    limited: totalParts > BILI_MAX_PARTS
+      ? { total: totalParts, parsed: BILI_MAX_PARTS }
+      : undefined,
+  };
+}
+
+// b23.tv 短链要跟一次重定向；顺手把各种入口链接归一成带 BV 号的形式
+async function resolveBilibiliUrl(rawUrl) {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    if (host === 'b23.tv' || host.endsWith('.b23.tv')) {
+      const resp = await fetch(rawUrl, {
+        headers: { 'User-Agent': UA },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      // fetch 跟完重定向后 resp.url 就是最终地址
+      const finalUrl = resp.url || '';
+      if (/BV[0-9A-Za-z]{10}/.test(finalUrl) || /\/video\/av\d+/i.test(finalUrl)) {
+        return finalUrl;
+      }
+      // 少数短链返回 200 的中转页，再从正文里捞一次
+      const html = await resp.text().catch(() => '');
+      const m = html.match(/https?:\/\/www\.bilibili\.com\/video\/[^"'\s<>\\]+/i);
+      if (m) return m[0].replace(/\\u002F/g, '/').replace(/\\\//g, '/');
+    }
+  } catch {
+    // 短链解析失败就按原链接继续，后面还会从原文里找 BV 号
+  }
+  return rawUrl;
+}
+
+async function biliPlayUrl(bvid, cid) {
+  const qs = new URLSearchParams({
+    bvid,
+    cid: String(cid),
+    qn: '80',          // 请求 1080P；未登录会自动降级到 64(720P)，不算失败
+    fnval: '1',        // 1 = durl 单文件 mp4（已含音轨），不需要合流
+    fnver: '0',
+    fourk: '1',
+    platform: 'html5',
+    high_quality: '1',
+  });
+  const data = await biliApi('/x/player/playurl?' + qs.toString());
+  if (data.code !== 0) throw biliError(data.code, data.message);
+
+  const d = data.data || {};
+  const first = Array.isArray(d.durl) ? d.durl[0] : null;
+  if (!first || !first.url) return null;
+
+  return {
+    url: first.url.replace(/^http:\/\//i, 'https://'),
+    size: first.size || 0,
+    quality: BILI_QUALITY_NAME[d.quality] || (d.quality ? String(d.quality) : ''),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 抖音 解析
+// ---------------------------------------------------------------------------
+//
+// 实测（2026-11）结论：抖音没有"纯 HTTP 就能拿数据"的口子。
+//   - /aweme/v1/web/aweme/detail  → Blocked by ArgusSecurityPlugin Uifid Not Found
+//   - 桌面 UA 抓分享页            → 返回 _$jsvmprt JS 虚拟机保护页，0 处 play_addr
+//   - 移动 UA 抓分享页            → 能拿到 _ROUTER_DATA（本文件的第 2 层策略）
+//   - 老接口 iteminfo / snssdk    → 空响应，已下线
+//
+// 所以做成三层降级：
+//   ① 短链归一化拿到作品 ID          （稳定）
+//   ② 移动端分享页的 SSR 数据         （对部分公开视频可能有效）
+//   ③ 可选的第三方解析端点            （wrangler.toml 里配置 DOUYIN_PARSER）
+// 三层都失败就抛结构化错误，前端据此给明确提示，而不是让人对着转圈猜。
+
+async function extractDouyin(rawUrl, env) {
+  const resolved = await resolveDouyinUrl(rawUrl);
+  const id = resolved.id;
+  if (!id) {
+    throw httpError('无法从链接中解析出抖音作品 ID', 400, 'douyin_no_id');
+  }
+
+  // ② 移动端分享页 SSR
+  try {
+    const ssr = await fetchDouyinSharePage(id);
+    const parsed = ssr ? parseDouyinPage(ssr) : null;
+    if (parsed && parsed.videos.length) {
+      return {
+        platform: 'douyin',
+        title: parsed.title,
+        duration: parsed.duration,
+        videos: parsed.videos,
+        via: 'ssr',
+      };
+    }
+  } catch {
+    // 继续降级
+  }
+
+  // ③ 第三方解析端点
+  const viaParser = await tryDouyinParser(resolved.pageUrl, id, env);
+  if (viaParser && viaParser.videos.length) {
+    return { platform: 'douyin', title: viaParser.title, videos: viaParser.videos, via: 'parser' };
+  }
+
+  throw httpError(
+    '抖音的分享页被 JS 虚拟机保护，服务端拿不到视频地址。' +
+      '要提取抖音，需要在 Worker 里配置一个第三方解析端点（wrangler.toml 的 DOUYIN_PARSER）。',
+    422,
+    'douyin_needs_parser'
+  );
+}
+
+async function resolveDouyinUrl(rawUrl) {
+  const pick = (s) => (String(s).match(/\/(?:video|note|slides)\/(\d{15,25})/) || [])[1] || null;
+
+  let id = pick(rawUrl);
+  let pageUrl = rawUrl;
+
+  if (!id) {
+    // v.douyin.com/xxxx 需要跟一次重定向才知道作品 ID
+    try {
+      const resp = await fetch(rawUrl, {
+        headers: { 'User-Agent': MOBILE_UA, Accept: 'text/html' },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      pageUrl = resp.url || rawUrl;
+      id = pick(pageUrl);
+      if (!id) {
+        const html = await resp.text().catch(() => '');
+        id = pick(html);
+        if (!id) {
+          const m = html.match(/"(?:aweme_id|itemId)"\s*:\s*"?(\d{15,25})"?/);
+          if (m) id = m[1];
+        }
+      }
+    } catch {
+      // 落回 null，由上层报错
+    }
+  }
+
+  return { id, pageUrl };
+}
+
+function fetchDouyinSharePage(id) {
+  return fetchHtmlWithUa(`https://www.iesdouyin.com/share/video/${id}/`, MOBILE_UA, 20000);
+}
+
+async function fetchHtmlWithUa(url, ua, timeoutMs = 20000) {
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': ua,
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!resp.ok) return null;
+    const text = await resp.text();
+    return text.length > 500 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+// 分享页把数据塞在 window._ROUTER_DATA 里。有数据时能挖到 play_addr.url_list；
+// 被风控或作品不存在时那块只剩页面配置，挖不到就返回 null。
+function parseDouyinPage(html) {
+  const m = html.match(/_ROUTER_DATA\s*=\s*(\{[\s\S]*?\})\s*<\/script>/);
+  if (!m) return null;
+
+  let data;
+  try {
+    data = JSON.parse(m[1]);
+  } catch {
+    return null;
+  }
+
+  const playAddr = findDeep(data, 'play_addr');
+  const urlList = playAddr && (playAddr.url_list || playAddr.urlList);
+  if (!Array.isArray(urlList) || !urlList.length) return null;
+
+  // playwm 是带水印版本，换成 play 取无水印
+  const clean = urlList
+    .map((u) => String(u).replace('/playwm/', '/play/').replace('playwm', 'play'))
+    .filter((u) => /^https?:\/\//i.test(u));
+
+  if (!clean.length) return null;
+
+  const desc = findDeep(data, 'desc');
+  const durationRaw = findDeep(data, 'duration');
+
+  return {
+    title: typeof desc === 'string' ? desc.slice(0, 120) : '',
+    duration:
+      typeof durationRaw === 'number'
+        ? Math.round(durationRaw / (durationRaw > 10000 ? 1000 : 1))
+        : 0,
+    videos: clean.slice(0, 3).map((u) => ({ url: u.replace(/^http:\/\//i, 'https://'), size: 0 })),
+  };
+}
+
+// 第三方解析端点。契约故意放宽：只要返回体里任意位置有一个像视频地址的字符串
+// 就认，这样常见的开源解析服务基本能直接接。
+//   wrangler.toml →  [vars]  DOUYIN_PARSER = "https://your-parser.example.com/api?url={url}"
+// 支持 {url} 与 {id} 两个占位符；不配置就跳过这一层。
+async function tryDouyinParser(pageUrl, id, env) {
+  const base = env && env.DOUYIN_PARSER;
+  if (!base || typeof base !== 'string') return null;
+
+  let endpoint = base;
+  if (endpoint.includes('{url}')) {
+    endpoint = endpoint.replace(/\{url\}/g, encodeURIComponent(pageUrl));
+  } else if (endpoint.includes('{id}')) {
+    endpoint = endpoint.replace(/\{id\}/g, encodeURIComponent(id));
+  } else {
+    endpoint = endpoint + (endpoint.includes('?') ? '&' : '?') + 'url=' + encodeURIComponent(pageUrl);
+  }
+
+  if (!/^https:\/\//i.test(endpoint)) return null;
+
+  try {
+    const resp = await fetch(endpoint, {
+      headers: { 'User-Agent': UA, Accept: 'application/json, text/plain, */*' },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!resp.ok) return null;
+    const text = await resp.text();
+    if (!text || text.length < 10) return null;
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      // 有些服务直接返回一段文本，用正则兜底
+      const raw = text.match(/https?:\/\/[^\s"'<>\\]+\.mp4[^\s"'<>\\]*/i);
+      return raw ? { videos: [{ url: raw[0].replace(/\\\//g, '/'), size: 0 }] } : null;
+    }
+
+    const urls = collectVideoUrls(data);
+    if (!urls.length) return null;
+
+    const desc = findDeep(data, 'desc');
+    return {
+      title: typeof desc === 'string' ? desc.slice(0, 120) : '',
+      videos: urls.slice(0, 3).map((u) => ({ url: u, size: 0 })),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// 深度遍历找一个 key（抖音的数据层级每个版本都在变，写死路径必挂）
+function findDeep(obj, key, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 14) return null;
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const hit = findDeep(item, key, depth + 1);
+      if (hit !== null && hit !== undefined) return hit;
+    }
+    return null;
+  }
+  if (Object.prototype.hasOwnProperty.call(obj, key)) {
+    const v = obj[key];
+    if (v !== null && v !== undefined) return v;
+  }
+  for (const v of Object.values(obj)) {
+    const hit = findDeep(v, key, depth + 1);
+    if (hit !== null && hit !== undefined) return hit;
+  }
+  return null;
+}
+
+function collectVideoUrls(obj, depth = 0, out = []) {
+  if (!obj || typeof obj !== 'object' || depth > 14 || out.length >= 6) return out;
+  for (const v of Object.values(obj)) {
+    if (typeof v === 'string') {
+      if (
+        /^https?:\/\//i.test(v) &&
+        /\.mp4|douyinvod|zjcdn|bytecdn|video_id=/i.test(v) &&
+        !/\.(jpe?g|png|webp|gif)/i.test(v)
+      ) {
+        out.push(v.replace(/\\\//g, '/'));
+      }
+    } else if (v && typeof v === 'object') {
+      collectVideoUrls(v, depth + 1, out);
+    }
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+// 限并发 map（B站 合集解析用）：既不打爆 Worker，也不会串行等到超时
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+
+  async function runner() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(limit, items.length) }, () => runner());
+  await Promise.all(runners);
+  return results;
 }
